@@ -13,6 +13,28 @@ Z = - 8 / 15
 SCALE = 1/15
 Count = None
 
+def round_ste(x: torch.Tensor):
+    """
+    Implement Straight-Through Estimator for rounding operation.
+    """
+    return (x.round() - x).detach() + x
+
+def sym_quant(x, scale, maxq):
+    scale = scale.to(x.device)
+    q = torch.clamp(round_ste(x / scale), -(maxq + 1), maxq)
+    return q, scale
+
+
+
+def get_percentile_thresholds(tensor: torch.Tensor, dim: int,
+                                 lower_quantile: float = 0.01,
+                                 upper_quantile: float = 0.99) -> tuple:
+    
+    q = torch.tensor([lower_quantile,upper_quantile], device=tensor.device)
+    threshold = torch.quantile(tensor, q, dim=dim, keepdim=True)
+    
+    return threshold
+
 def flash_attention_simulated(Q, K, V, block_M=128, block_N=128):
     """
     修改版实现：先计算Q块与完整K的注意力分数，再分块K进行online softmax
@@ -68,23 +90,42 @@ def flash_attention_simulated(Q, K, V, block_M=128, block_N=128):
             m_new = torch.maximum(m_i, s_max)
             
             # 计算指数项
-            exp_fp16 = False
-            if not exp_fp16:
-                p = torch.exp(s_block - s_max.unsqueeze(-1))#.to(ori_dtype)
-                assert p.dtype == torch.float32
+            global_max = True
+            if not global_max:
+                exp_fp16 = False
+                if not exp_fp16:
+                    p = torch.exp(s_block - s_max.unsqueeze(-1))#.to(ori_dtype)
+                    assert p.dtype == torch.float32
+                else:
+                    p = torch.exp(s_block.to(torch.float16) - s_max.unsqueeze(-1).to(torch.float16))
             else:
-                p = torch.exp(s_block.to(torch.float16) - s_max.unsqueeze(-1))
-
-            p_int4 = p / SCALE
-            p_int4 = p_int4.round().to(torch.int8)
-            if Count is None:
-                Count = torch.bincount(p_int4.view(-1), minlength=16)
-            else:
-                Count += torch.bincount(p_int4.view(-1), minlength=16)
+                p = torch.exp(s_block - m_new.unsqueeze(-1))#.to(ori_dtype)
+            
+            test_int4 = True
+            if test_int4:
+                p_int4 = (p + Z) / SCALE
+                p_int4 = p_int4.round().to(torch.int8)
+                
+                p = p_int4.to(torch.float16) * SCALE - Z
+            
+            count_int4 = False
+            if count_int4:
+                p_int4 = p / SCALE
+                p_int4 = p_int4.round().to(torch.int8)
+                if Count is None:
+                    Count = torch.bincount(p_int4.view(-1), minlength=16)
+                else:
+                    Count += torch.bincount(p_int4.view(-1), minlength=16)
             # 更新归一化项和输出
-            l_new = torch.exp(m_i - m_new) * l_i + torch.exp(s_max - m_new) * p.sum(dim=-1)
-            o_new = (torch.exp(m_i - m_new).unsqueeze(-1) * o_i + 
-                    torch.exp(s_max - m_new).unsqueeze(-1) * torch.matmul(p.to(ori_dtype), v_block)).to(torch.float32)
+            
+            if not global_max:
+                l_new = torch.exp(m_i - m_new) * l_i + torch.exp(s_max - m_new) * p.sum(dim=-1)
+                o_new = (torch.exp(m_i - m_new).unsqueeze(-1) * o_i + 
+                        torch.exp(s_max - m_new).unsqueeze(-1) * torch.matmul(p.to(ori_dtype), v_block)).to(torch.float32)
+            else:
+                l_new = torch.exp(m_i - m_new) * l_i + p.sum(dim=-1)
+                o_new = (torch.exp(m_i - m_new).unsqueeze(-1) * o_i +
+                         torch.matmul(p.to(ori_dtype), v_block)).to(torch.float32)
             # 归一化
             # valid_mask = l_new > 0
             # o_new[valid_mask] = o_new[valid_mask] / l_new[valid_mask].unsqueeze(-1)
@@ -117,8 +158,12 @@ res = flash_attention_simulated(query, key, v)
 ref_res = torch.nn.functional.scaled_dot_product_attention(query, key, v,
                                         scale = D ** -0.5)
 print(torch.allclose(res, ref_res,atol=.01, rtol=.01))
+# mask = torch.isclose(res, ref_res, atol=.01, rtol=.01)
+# diff = torch.abs(res[~mask] - ref_res[~mask])
+# print(torch.max(diff))
 torch.testing.assert_close(res, ref_res, atol=.01, rtol=.01)
 
+exit()
 print(Count)
 
 
@@ -165,4 +210,4 @@ def plot_and_save_bincount(counts, output_path="histogram.png", title="Value Dis
     print(f"直方图已保存至: {output_path}")
 
 
-plot_and_save_bincount(Count, "histogram2.png" )
+plot_and_save_bincount(Count, "histogram_globalmax.png" )
